@@ -1,9 +1,22 @@
 /* ================================================
-   ザックリ家計簿 - Application Logic
+   ザックリ家計簿 - Application Logic (Firebase版)
    ================================================ */
 
 (function () {
   'use strict';
+
+  // ---- Firebase Config ----
+  const firebaseConfig = {
+    apiKey: "AIzaSyBPJcEzV2LD8z15d8HXCWV7Px52Quh2rWo",
+    authDomain: "zaku-kake.firebaseapp.com",
+    projectId: "zaku-kake",
+    storageBucket: "zaku-kake.firebasestorage.app",
+    messagingSenderId: "912775929665",
+    appId: "1:912775929665:web:3b1932902033da9521cbc0"
+  };
+
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.firestore();
 
   // ---- Categories ----
   const EXPENSE_CATEGORIES = [
@@ -21,7 +34,7 @@
   ];
 
   const INCOME_CATEGORIES = [
-    { id: 'salary', emoji: '💼', label: '給料', color: '#00e6b4' },
+    { id: 'salary', emoji: '💼', label: '給料', color: '#10b981' },
     { id: 'bonus', emoji: '🎁', label: 'ボーナス', color: '#facc15' },
     { id: 'sidejob', emoji: '💻', label: '副業', color: '#60a5fa' },
     { id: 'investment', emoji: '📈', label: '投資', color: '#a855f7' },
@@ -37,29 +50,63 @@
     entryType: 'expense',
     dashboardMonth: new Date(),
     historyMonth: new Date(),
+    userCode: null,
   };
 
-  // ---- LocalStorage ----
-  const STORAGE_KEY = 'zakkuri_kakeibo_data';
+  let unsubscribeFirestore = null;
+  let saveTimeout = null;
 
-  function saveData() {
-    const data = {
-      records: state.records,
-      budget: state.budget,
-    };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  // ---- LocalStorage (for user code only) ----
+  const CODE_KEY = 'zakkuri_user_code';
+
+  function getSavedCode() {
+    return localStorage.getItem(CODE_KEY);
   }
 
-  function loadData() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      const data = JSON.parse(raw);
-      if (data.records) state.records = data.records;
-      if (data.budget) state.budget = data.budget;
-    } catch (e) {
-      console.error('Failed to load data:', e);
+  function setSavedCode(code) {
+    localStorage.setItem(CODE_KEY, code);
+  }
+
+  // ---- Generate random code ----
+  function generateCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    for (let i = 0; i < 6; i++) {
+      code += chars[Math.floor(Math.random() * chars.length)];
     }
+    return code;
+  }
+
+  // ---- Firestore read/write ----
+  function getUserDocRef() {
+    return db.collection('users').doc(state.userCode);
+  }
+
+  function saveToFirestore() {
+    if (!state.userCode) return;
+    clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(() => {
+      getUserDocRef().set({
+        records: state.records,
+        budget: state.budget,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      }).catch(e => console.error('Save error:', e));
+    }, 500);
+  }
+
+  function startFirestoreListener() {
+    if (unsubscribeFirestore) unsubscribeFirestore();
+
+    unsubscribeFirestore = getUserDocRef().onSnapshot((doc) => {
+      if (doc.exists) {
+        const data = doc.data();
+        if (data.records) state.records = data.records;
+        if (data.budget !== undefined) state.budget = data.budget;
+        updateAll();
+      }
+    }, (err) => {
+      console.error('Firestore listener error:', err);
+    });
   }
 
   // ---- DOM Refs ----
@@ -68,12 +115,71 @@
 
   // ---- Init ----
   function init() {
-    loadData();
+    const savedCode = getSavedCode();
+    if (savedCode) {
+      state.userCode = savedCode;
+      startApp();
+    } else {
+      showSetupModal();
+    }
+  }
+
+  function startApp() {
     renderCategories();
     bindEvents();
     switchTab('input');
+    startFirestoreListener();
     updateBudgetBar();
     renderRecentItems();
+    if ($('#user-code-text')) {
+      $('#user-code-text').textContent = state.userCode;
+    }
+  }
+
+  // ---- Setup Modal ----
+  function showSetupModal() {
+    $('#setup-modal').classList.add('show');
+
+    $('#setup-new-btn').addEventListener('click', async () => {
+      const code = generateCode();
+      state.userCode = code;
+      setSavedCode(code);
+      // Create empty document in Firestore
+      await getUserDocRef().set({
+        records: [],
+        budget: 0,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      });
+      $('#setup-modal').classList.remove('show');
+      startApp();
+      showToast(`🎉 合言葉: ${code}`);
+    });
+
+    $('#setup-join-btn').addEventListener('click', async () => {
+      const code = $('#setup-code-input').value.trim().toUpperCase();
+      if (code.length !== 6) {
+        showToast('⚠️ 6桁のコードを入力してください');
+        return;
+      }
+      // Check if document exists
+      const doc = await getUserDocRef.call({ userCode: code });
+      const docRef = db.collection('users').doc(code);
+      const snap = await docRef.get();
+      if (!snap.exists) {
+        showToast('⚠️ このコードのデータが見つかりません');
+        return;
+      }
+      state.userCode = code;
+      setSavedCode(code);
+      $('#setup-modal').classList.remove('show');
+      startApp();
+      showToast('✅ データを引き継ぎました！');
+    });
+
+    // Allow Enter key
+    $('#setup-code-input').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') $('#setup-join-btn').click();
+    });
   }
 
   // ---- Category Rendering ----
@@ -115,7 +221,7 @@
       btn.addEventListener('click', () => switchType(btn.dataset.type));
     });
 
-    // Amount Input - format with commas
+    // Amount Input
     const amountInput = $('#amount-input');
     amountInput.addEventListener('input', () => {
       let val = amountInput.value.replace(/[^\d]/g, '');
@@ -152,19 +258,6 @@
       });
     });
 
-    // Export & Reset
-    $('#export-btn').addEventListener('click', exportData);
-    $('#reset-btn').addEventListener('click', () => {
-      showConfirm('本当に全てのデータを削除しますか？\nこの操作は元に戻せません。', () => {
-        state.records = [];
-        state.budget = 0;
-        saveData();
-        updateAll();
-        closeSettings();
-        showToast('🗑️ データをリセットしました');
-      });
-    });
-
     // Inline budget editing
     $('#budget-total-display').addEventListener('click', startInlineBudgetEdit);
     const inlineInput = $('#budget-inline-input');
@@ -177,6 +270,28 @@
       let val = inlineInput.value.replace(/[^\d]/g, '');
       if (val.length > 10) val = val.slice(0, 10);
       inlineInput.value = val ? Number(val).toLocaleString() : '';
+    });
+
+    // Copy code
+    $('#copy-code-btn').addEventListener('click', () => {
+      navigator.clipboard.writeText(state.userCode).then(() => {
+        showToast('📋 コードをコピーしました');
+      }).catch(() => {
+        showToast(`合言葉: ${state.userCode}`);
+      });
+    });
+
+    // Export & Reset
+    $('#export-btn').addEventListener('click', exportData);
+    $('#reset-btn').addEventListener('click', () => {
+      showConfirm('本当に全てのデータを削除しますか？\nこの操作は元に戻せません。', () => {
+        state.records = [];
+        state.budget = 0;
+        saveToFirestore();
+        updateAll();
+        closeSettings();
+        showToast('🗑️ データをリセットしました');
+      });
     });
 
     // Dashboard month nav
@@ -242,7 +357,7 @@
     };
 
     state.records.unshift(record);
-    saveData();
+    saveToFirestore();
 
     // Reset form
     $('#amount-input').value = '';
@@ -251,14 +366,12 @@
     renderCategories();
     validateForm();
 
-    // Feedback
     const emoji = state.entryType === 'expense' ? '💸' : '💰';
     showToast(`${emoji} ¥${amount.toLocaleString()} を記録しました`);
 
     updateBudgetBar();
     renderRecentItems();
 
-    // Button animation
     const btn = $('#save-btn');
     btn.style.transform = 'scale(0.95)';
     setTimeout(() => { btn.style.transform = ''; }, 150);
@@ -309,10 +422,8 @@
     const remainLabel = $('#budget-remaining-label');
     const pctLabel = $('#budget-pct-label');
 
-    // Numerator: spent amount
     numeratorEl.textContent = `¥${spent.toLocaleString()}`;
 
-    // Denominator: budget total
     if (state.budget <= 0) {
       denominatorEl.textContent = '未設定 ✎';
       progressEl.style.width = '0%';
@@ -362,7 +473,7 @@
 
     const val = parseAmount(input.value);
     state.budget = val;
-    saveData();
+    saveToFirestore();
 
     displayEl.style.display = '';
     editEl.style.display = 'none';
@@ -421,7 +532,6 @@
 
     const legendEl = $('#pie-legend');
 
-    // Group by category
     const groups = {};
     expenses.forEach(r => {
       if (!groups[r.categoryId]) {
@@ -461,7 +571,6 @@
       startAngle += sliceAngle;
     });
 
-    // Center text
     ctx.fillStyle = '#1a1d23';
     ctx.font = '800 20px Inter, sans-serif';
     ctx.textAlign = 'center';
@@ -471,7 +580,6 @@
     ctx.font = '500 11px Inter, sans-serif';
     ctx.fillText('合計', cx, cy + 14);
 
-    // Legend
     legendEl.innerHTML = sorted.map(g => {
       const pct = ((g.amount / total) * 100).toFixed(1);
       return `
@@ -501,7 +609,6 @@
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, chartW, chartH);
 
-    // Sum per day
     const daily = new Array(daysInMonth).fill(0);
     expenses.forEach(r => {
       const d = new Date(r.date).getDate();
@@ -515,7 +622,6 @@
     const topPad = 16;
     const barArea = bottom - topPad;
 
-    // Grid lines
     ctx.strokeStyle = 'rgba(0, 0, 0, 0.06)';
     ctx.lineWidth = 1;
     for (let i = 0; i < 4; i++) {
@@ -526,7 +632,6 @@
       ctx.stroke();
     }
 
-    // Today
     const today = new Date();
     const isCurrentMonth = (today.getFullYear() === year && today.getMonth() === month);
 
@@ -535,7 +640,6 @@
       const h = val > 0 ? Math.max((val / maxVal) * barArea, 3) : 0;
       const y = bottom - h;
 
-      // Bar
       const isToday = isCurrentMonth && (i + 1) === today.getDate();
       if (h > 0) {
         const grad = ctx.createLinearGradient(x, y, x, bottom);
@@ -552,7 +656,6 @@
         ctx.fill();
       }
 
-      // Day label
       if (daysInMonth <= 15 || (i + 1) % 2 === 1 || (i + 1) === daysInMonth) {
         ctx.fillStyle = isToday ? '#10b981' : '#9ca3af';
         ctx.font = `${isToday ? '600' : '400'} 9px Inter, sans-serif`;
@@ -580,7 +683,6 @@
     const msgEl = $('#score-message');
 
     if (state.budget <= 0) {
-      // Empty ring
       ctx.beginPath();
       ctx.arc(cx, cy, radius, 0, Math.PI * 2);
       ctx.strokeStyle = '#e5e7eb';
@@ -607,14 +709,12 @@
     else if (score >= 40) { color = '#f97316'; msgClass = 'warning'; msg = '⚠️ ちょっと使いすぎかも…'; }
     else { color = '#ef4444'; msgClass = 'danger'; msg = '🔥 財布がピンチ！'; }
 
-    // Background ring
     ctx.beginPath();
     ctx.arc(cx, cy, radius, 0, Math.PI * 2);
     ctx.strokeStyle = '#e5e7eb';
     ctx.lineWidth = lineW;
     ctx.stroke();
 
-    // Score ring
     const startA = -Math.PI / 2;
     const endA = startA + (score / 100) * Math.PI * 2;
     ctx.beginPath();
@@ -650,7 +750,6 @@
 
     emptyEl.style.display = 'none';
 
-    // Group by date
     const groups = {};
     records.forEach(r => {
       const dateKey = new Date(r.date).toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' });
@@ -680,14 +779,13 @@
       </div>
     `).join('');
 
-    // Delete buttons
     listEl.querySelectorAll('.history-delete-btn').forEach(btn => {
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
         const id = btn.dataset.id;
         showConfirm('この記録を削除しますか？', () => {
           state.records = state.records.filter(r => r.id !== id);
-          saveData();
+          saveToFirestore();
           updateAll();
           showToast('🗑️ 記録を削除しました');
         });
@@ -704,6 +802,9 @@
   // ---- Settings ----
   function openSettings() {
     $('#budget-input').value = state.budget > 0 ? state.budget.toLocaleString() : '';
+    if ($('#user-code-text')) {
+      $('#user-code-text').textContent = state.userCode || '------';
+    }
     $('#settings-modal').classList.add('show');
   }
 
@@ -714,7 +815,7 @@
   function saveSettings() {
     const val = parseAmount($('#budget-input').value);
     state.budget = val;
-    saveData();
+    saveToFirestore();
     updateBudgetBar();
     closeSettings();
     showToast('✅ 設定を保存しました');
