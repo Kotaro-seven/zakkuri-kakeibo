@@ -162,7 +162,6 @@
         return;
       }
       // Check if document exists
-      const doc = await getUserDocRef.call({ userCode: code });
       const docRef = db.collection('users').doc(code);
       const snap = await docRef.get();
       if (!snap.exists) {
